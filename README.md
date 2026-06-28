@@ -1,4 +1,8 @@
-# mtree — Mekari Git Worktree
+<p align="center">
+  <img src="assets/mtree-256.png" alt="mtree icon" width="120" height="120">
+</p>
+
+<h1 align="center">mtree — Mekari Git Worktree</h1>
 
 `mtree` wraps `git worktree` into one-command operations. It implements
 [matklad's "concurrency lane" model](https://matklad.github.io/2024/07/25/git-worktrees.html) —

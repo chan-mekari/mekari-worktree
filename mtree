@@ -1,0 +1,1018 @@
+#!/usr/bin/env bash
+#==============================================================================
+# talenta-core-worktree — git worktree concurrency helper for talenta-core
+#==============================================================================
+#
+# WHAT THIS IS
+#   A thin wrapper around `git worktree` that turns matklad's "concurrency lane"
+#   model into one-command operations, tailored to the talenta-core monorepo
+#   (web app on `master`, mobile API on `master-mobile-api`, integration on
+#   `develop`). Instead of `git checkout`/`git stash` churn, you keep a few
+#   long-lived working directories ("lanes"), each playing a fixed role, all
+#   backed by ONE shared .git object store.
+#
+#   Model (https://matklad.github.io/2024/07/25/git-worktrees.html):
+#     "worktrees ... as a means to manage concurrency in your tasks.
+#      main / work / review / fuzz / scratch."
+#
+# THE LANES (all under ONE container next to the main checkout: <parent>/<repo>-worktrees/)
+#   main      ~/www/talenta-core                                    develop            (the main checkout, kept clean)
+#   mobile    ~/www/talenta-core-worktrees/talenta-core-mobile      master-mobile-api  (persistent)
+#   work      ~/www/talenta-core-worktrees/talenta-core-<branch>    <type>/<TICKET>    (one per ticket — parallel)
+#   hotfix    ~/www/talenta-core-worktrees/talenta-core-hotfix-<T>  hotfix/<TICKET>    (off master / master-mobile-api)
+#   review    ~/www/talenta-core-worktrees/talenta-core-review      detached           (a colleague's branch)
+#   scratch   /tmp/tc-<name>                                        detached           (throwaway; /tmp purges on reboot)
+#   agents    .claude/worktrees/*                                   worktree-*         (Claude Code, `claude --worktree`)
+#
+# TICKET TYPES ARE DATA, NOT CODE: one engine (cmd_work → _provision_lane) routes every type
+# through the TCW_TYPES table below (platform --web/--mobile picks the base column). Add one row
+# and that type instantly works as `work <type> <TICKET>` and as a `<type> <TICKET>` subcommand.
+# Lifecycle: `init` (idempotent setup) · `remove <TICKET>` (drop a lane, keep the branch) · `cleanup`.
+#
+# DEPENDENCY BOOTSTRAP — clone-or-install hybrid (NOT symlink)
+#   A new worktree has no .env, no vendor/, no node_modules. For each of
+#   vendor (composer) and node_modules (yarn):
+#     * lockfile matches main  -> APFS copy-on-write clone (`cp -c -R`):
+#                                 isolated, near-instant, ~0 disk until divergence.
+#     * lockfile differs / no clonefile -> real install (composer install /
+#                                 yarn install --frozen-lockfile).
+#   Symlinking these dirs is REJECTED: this repo's composer post-install-cmd /
+#   post-update-cmd run `cp -rf docker/{vendor,node_modules}/* ...`, yarn rewrites
+#   .yarn-integrity, and builds write node_modules/.cache — through a symlink all
+#   of that would corrupt the pristine main checkout, and two concurrent agents
+#   would race on one physical directory. COW clone avoids every bit of that.
+#   Only `.env` is gitignored and needs copying; .env.bitbucket/.env.example are
+#   TRACKED, so git materializes them in every worktree automatically.
+#
+# GOTCHAS
+#   * yarn, not npm.   * commit hooks need Node 16 (`--no-verify` is the escape).
+#   * never `git gc` while Claude agents are active (shared object store).
+#   * a branch can be checked out in only one worktree (work/hotfix create fresh
+#     branches; review is detached) — so this never collides.
+#   * always tear down with `remove`/`cleanup`; never `rm -rf` (orphans metadata).
+#
+# USAGE
+#   bin/talenta-core-worktree <command> [args]      (run `help` for the full list)
+#==============================================================================
+
+set -euo pipefail
+
+#------------------------------------------------------------------------------
+# Config — base branches are PER-REPO: git config wt.{base,web,mobile} → env → inferred.
+#   wt.base    integration/default base   (else: origin/HEAD → develop/main/master → current branch)
+#   wt.web     web "prod" base for fasttrack/hotfix   (else: master)
+#   wt.mobile  Mobile-API base                          (else: master-mobile-api)
+#   Pin one per repo, e.g.:   git config wt.base develop
+# The TCW_TYPES registry + the three TCW_* bases are resolved AFTER repo discovery (below).
+#------------------------------------------------------------------------------
+TCW_ENV_FILE="${TCW_ENV_FILE:-.env}"            # the only gitignored local config
+TCW_INCLUDE="${TCW_INCLUDE:-.worktreeinclude}"  # Claude Code per-worktree copy list (used by `init`)
+TCW_VERSION="${TCW_VERSION:-1.0.6}"             # shown in the welcome banner
+
+# Resolve this repo's default base. Always returns 0 (so it's safe inside $() under set -e).
+_resolve_base() {
+  local b c
+  b="$(git -C "$MAIN" config --get wt.base 2>/dev/null || true)"; [[ -n "$b" ]] && { printf '%s' "$b"; return 0; }
+  [[ -n "${TCW_BASE:-}" ]] && { printf '%s' "$TCW_BASE"; return 0; }
+  b="$(git -C "$MAIN" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || true)"
+  [[ -n "$b" ]] && { printf '%s' "$b"; return 0; }
+  for c in develop main master; do
+    if git -C "$MAIN" show-ref --verify --quiet "refs/remotes/origin/$c"; then printf '%s' "$c"; return 0; fi
+  done
+  b="$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"; printf '%s' "${b:-main}"; return 0
+}
+
+#------------------------------------------------------------------------------
+# Pretty output
+#------------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YLW=$'\033[33m'; C_BLU=$'\033[34m'
+  C_BRAND=$'\033[38;2;139;92;246m'              # Mekari purple (#8B5CF6) for the banner
+else
+  C_RESET=''; C_DIM=''; C_BOLD=''; C_RED=''; C_GRN=''; C_YLW=''; C_BLU=''; C_BRAND=''
+fi
+# Human lines normally go to stdout, but to stderr when --json so stdout stays pure JSON.
+_say() { if [[ "${OPT_JSON:-}" == 1 ]]; then printf '%s\n' "$*" >&2; else printf '%s\n' "$*"; fi; }
+log()  { _say "${C_DIM}· $*${C_RESET}"; }
+info() { _say "${C_BLU}▸ $*${C_RESET}"; }
+ok()   { _say "${C_GRN}✓ $*${C_RESET}"; }
+warn() { printf '%s\n' "${C_YLW}! $*${C_RESET}" >&2; }
+die()  { printf '%s\n' "${C_RED}✗ $*${C_RESET}" >&2; exit 1; }
+
+#------------------------------------------------------------------------------
+# Repo discovery — works from ANY worktree
+#------------------------------------------------------------------------------
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository."
+
+# MAIN worktree = first entry of `git worktree list` (robust on bare/submodule).
+MAIN="$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+[[ -n "$MAIN" && -d "$MAIN" ]] || die "Could not resolve the main worktree."
+PARENT="$(dirname "$MAIN")"                           # e.g. /Users/you/www
+REPO="$(basename "$MAIN")"                            # e.g. talenta-core
+
+# No repo gate — mwt operates on whatever git repo you run it in (project = that folder's name).
+
+# Per-repo bases + the ticket-type registry. NOTE: unquoted heredoc → ${TCW_*} expand into the rows,
+# so every type's base column follows THIS repo's resolved base/web/mobile branches.
+TCW_BASE="$(_resolve_base)"
+TCW_WEB_PROD="$(git -C "$MAIN" config --get wt.web 2>/dev/null || echo "${TCW_WEB_PROD:-master}")"
+TCW_MOBILE_PROD="$(git -C "$MAIN" config --get wt.mobile 2>/dev/null || echo "${TCW_MOBILE_PROD:-master-mobile-api}")"
+TCW_TYPES="$(cat <<REG
+bugfix|bugfix|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+subtask|subtask|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+fasttrack|fasttrack|${TCW_WEB_PROD}|${TCW_MOBILE_PROD}|standard
+task|task|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+story|story|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+improvement|improvement|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+techdebt|chore|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+feature|feature|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+epic|epic|${TCW_BASE}|${TCW_MOBILE_PROD}|integration
+spike|spike|${TCW_BASE}|${TCW_MOBILE_PROD}|standard
+REG
+)"
+
+# All tool-created lanes live under ONE container dir next to the main checkout:
+#   <parent>/<repo>-worktrees/<repo>-<suffix>   e.g. ~/www/talenta-core-worktrees/talenta-core-bugfix-TM-1
+WT_ROOT="$PARENT/$REPO-worktrees"
+wt_dir()  { printf '%s/%s-%s' "$WT_ROOT" "$REPO" "$1"; }   # lane -> <repo>-worktrees/<repo>-<suffix>
+
+# ── Docker (laradock) integration ────────────────────────────────────────────
+# composer installs run INSIDE the laradock workspace container (PHP parity), never on the host.
+# laradock mounts $PARENT at $TCW_DOCKER_CODE_ROOT, so a host lane path maps 1:1 into the container.
+# Override per-repo:  git config wt.dockerDir <path>  /  wt.dockerService  /  wt.dockerCodeRoot
+TCW_DOCKER_DIR="$(git -C "$MAIN" config --get wt.dockerDir 2>/dev/null || echo "${TCW_DOCKER_DIR:-}")"
+[[ -z "$TCW_DOCKER_DIR" && -f "$PARENT/talenta-docker-dev/docker-compose.yml" ]] && TCW_DOCKER_DIR="$PARENT/talenta-docker-dev"
+TCW_DOCKER_SERVICE="$(git -C "$MAIN" config --get wt.dockerService 2>/dev/null || echo "${TCW_DOCKER_SERVICE:-workspace}")"
+TCW_DOCKER_CODE_ROOT="$(git -C "$MAIN" config --get wt.dockerCodeRoot 2>/dev/null || echo "${TCW_DOCKER_CODE_ROOT:-/var/www}")"
+
+_docker_compose() { docker compose -f "$TCW_DOCKER_DIR/docker-compose.yml" "$@"; }
+_docker_path()    { printf '%s%s' "$TCW_DOCKER_CODE_ROOT" "${1#$PARENT}"; }   # host lane path -> container path
+_docker_running() {
+  [[ -n "$TCW_DOCKER_DIR" && -f "$TCW_DOCKER_DIR/docker-compose.yml" ]] || return 1
+  _docker_compose ps --format '{{.Service}} {{.State}}' 2>/dev/null | grep -qE "^${TCW_DOCKER_SERVICE} running"
+}
+
+# ── Per-worktree local hostname (talenta-docker-dev/bin/talenta-host companion) ─
+# On lane create we register a deterministic *.local hostname (nginx vhost +
+# /etc/hosts + APP_URL) so the lane is browsable immediately; on remove we tear it
+# down. All logic lives in talenta-host; here we only call it, and NEVER let a
+# hostname hiccup abort the underlying git/worktree operation.
+_host_script(){ printf '%s/bin/talenta-host' "${TCW_DOCKER_DIR:-}"; }
+_host_enabled(){ [[ "$REPO" == "talenta-core" && -n "${TCW_DOCKER_DIR:-}" && -x "$(_host_script)" ]]; }
+_register_host(){    # <worktree-dir>
+  _host_enabled || return 0
+  info "  host: registering local hostname for $(basename "$1")…"
+  "$(_host_script)" register "$1" 1>&2 || warn "  host: registration failed — lane still usable (run 'talenta-host sync' later)."
+}
+_unregister_host(){  # <worktree-dir-or-path>
+  _host_enabled || return 0
+  "$(_host_script)" unregister "$1" 1>&2 || warn "  host: cleanup failed for $(basename "$1") (run 'talenta-host sync' to reconcile)."
+}
+
+# Make this repo's worktree links RELATIVE (../../<repo>/.git/...) so a lane resolves both on the host
+# (/Users/...) and inside the container (/var/www/...). The 'relativeworktrees' extension marker that
+# modern git adds is stripped, because older in-container git refuses it. Idempotent; cheap to re-run.
+_relativize_worktrees() {
+  git -C "$MAIN" -c worktree.useRelativePaths=true worktree repair >/dev/null 2>&1 || true
+  git -C "$MAIN" config --unset-all extensions.relativeworktrees 2>/dev/null || true
+}
+
+is_worktree() {
+  git worktree list --porcelain | awk '/^worktree /{print $2}' | grep -qxF "$1"
+}
+branch_exists() { git show-ref --verify --quiet "refs/heads/$1"; }
+# Path of the worktree that currently has <branch> checked out (empty if none).
+worktree_for_branch() {
+  git worktree list --porcelain \
+    | awk -v b="refs/heads/$1" '/^worktree /{p=$2} ($1=="branch" && $2==b){print p}'
+}
+# Short branch checked out at <path> (empty if detached/none) — works even if the dir is gone.
+_branch_of_worktree() {  # <path>
+  git worktree list --porcelain \
+    | awk -v p="$1" '/^worktree /{w=$2} ($1=="branch" && w==p){sub(/^refs\/heads\//,"",$2); print $2}'
+}
+# Does <ticket> appear as a whole token in <branch> or in the basename of <path>?
+_match_ticket() {  # <ticket> <path> <branch>
+  local t="$1" p="$2" b="$3" base; base="$(basename "$p")"
+  [[ "$b" == "$t" || "$b" == */"$t" || "$b" == */"$t"-* ]] && return 0
+  [[ "$base" == *-"$t" || "$base" == *-"$t"-* ]] && return 0
+  return 1
+}
+# Worktree path(s) whose branch or dir references <ticket> (one per line; empty if none).
+_worktrees_for_ticket() {  # <ticket>
+  local t="$1" p="" b="" line
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) p="${line#worktree }"; b="" ;;
+      branch\ *)   b="${line#branch refs/heads/}" ;;
+      "")          [[ -n "$p" ]] && _match_ticket "$t" "$p" "$b" && printf '%s\n' "$p"; p=""; b="" ;;
+    esac
+  done < <(git worktree list --porcelain; printf '\n')
+}
+# Resolve a user token to a worktree dir, most-specific match first:
+#   main → the exact branch checked out somewhere → a ticket (fuzzy, like `remove`) → the conventional lane dir.
+# Prints the path on success; on no match (or an ambiguous ticket) dies with a message. Safe in $() —
+# die() exits only the substitution subshell, so callers guard with `|| exit 1`.
+_resolve_lane() {  # <ticket|branch|suffix|main>
+  local token="$1" dir matches n
+  [[ "$token" == main ]] && { printf '%s\n' "$MAIN"; return; }
+  dir="$(worktree_for_branch "$token")"                 # 1. exact branch currently checked out
+  [[ -n "$dir" ]] && { printf '%s\n' "$dir"; return; }
+  matches="$(_worktrees_for_ticket "$token")"           # 2. ticket → branch/dir fuzzy match (same as `remove`)
+  if [[ -n "$matches" ]]; then
+    n="$(printf '%s\n' "$matches" | grep -c .)"
+    (( n > 1 )) && die "'$token' matches several lanes — be more specific:
+$matches"
+    printf '%s\n' "$matches"; return
+  fi
+  dir="$(wt_dir "$(_slug "$token")")"                   # 3. conventional lane dir for a slugified suffix
+  [[ -d "$dir" ]] && { printf '%s\n' "$dir"; return; }
+  die "no worktree for '$token' (tried branch, ticket, and lane $dir) — see '$(self) ls'."
+}
+self() { printf 'mwt'; }   # display command name (the alias users type)
+# Is <path> a locked worktree? (parses the porcelain block for that path)
+_is_locked() {
+  git worktree list --porcelain \
+    | awk -v p="$1" '/^worktree /{w=$2} /^locked/{if(w==p)f=1} END{exit f?0:1}'
+}
+# Registry row for <type> (prints "type|prefix|web-base|mobile-base|mode"); exit 1 if unknown.
+# Literal first-field match (no regex/glob surprises; also rejects an empty type).
+_type_row() { awk -F'|' -v t="$1" '$1==t && NF>=5{print; f=1; exit} END{exit f?0:1}' <<<"$TCW_TYPES"; }
+# Slugify into a safe branch/dir token: keep [A-Za-z0-9._-], collapse any other run to '-'.
+_slug() { printf '%s' "$1" | tr -C 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//'; }
+# Machine-readable result line (only when --json). Uses caller's $wtype.
+_emit() {  # <branch> <base> <lane> <status>
+  [[ "${OPT_JSON:-}" == 1 ]] || return 0
+  printf '{"type":"%s","platform":"%s","branch":"%s","base":"%s","lane":"%s","status":"%s"}\n' \
+    "${wtype:-}" "${OPT_PLATFORM:-web}" "$1" "$2" "$3" "$4"
+}
+
+#------------------------------------------------------------------------------
+# Bootstrap: copy .env, then clone-or-install vendor & node_modules
+#------------------------------------------------------------------------------
+_lockhash() { git hash-object "$1" 2>/dev/null || echo "NO_LOCK"; }
+
+# _provision <label> <lockfile> <depdir> <installer-cmd>  (cwd-independent; uses $WT)
+# Run `composer install` for a worktree INSIDE the laradock workspace container (PHP 7.4 parity).
+# Per config (always-container): the workspace MUST be running, else we fail loudly — never host PHP.
+_composer_install_in_container() {
+  local wt="$1" cpath
+  _docker_running || die "composer must run in the '$TCW_DOCKER_SERVICE' container, but it isn't running.
+  Start laradock first:      (cd ${TCW_DOCKER_DIR:-<laradock-dir>} && docker compose up -d $TCW_DOCKER_SERVICE)
+  Or point mwt at laradock:   git -C \"$MAIN\" config wt.dockerDir <laradock-dir>"
+  cpath="$(_docker_path "$wt")"
+  info "  composer: installing in container [$TCW_DOCKER_SERVICE:$cpath]…"
+  _docker_compose exec -T "$TCW_DOCKER_SERVICE" \
+    bash -lc "cd $(printf '%q' "$cpath") && composer install --no-interaction --prefer-dist" 1>&2 \
+    || die "composer install failed in container ($TCW_DOCKER_SERVICE:$cpath)."
+}
+
+_provision() {
+  local label="$1" lock="$2" dep="$3" installer="$4"
+  if [[ -e "$WT/$dep" && ! -L "$WT/$dep" ]]; then
+    log "  $label: $dep already present — skipping."; return
+  fi
+  rm -rf "$WT/$dep" 2>/dev/null || true   # clear a stale symlink/partial
+  if [[ -f "$MAIN/$lock" && -f "$WT/$lock" \
+        && "$(_lockhash "$MAIN/$lock")" == "$(_lockhash "$WT/$lock")" \
+        && -d "$MAIN/$dep" ]]; then
+    log "  $label: $lock matches main → copy-on-write clone of $dep"
+    if cp -c -R "$MAIN/$dep" "$WT/$dep" 2>/dev/null; then
+      ok  "  $label: cloned $dep (isolated, copy-on-write)."; return
+    fi
+    warn "  $label: clonefile unavailable (non-APFS?) — falling back to install."
+    rm -rf "$WT/$dep" 2>/dev/null || true
+  else
+    log "  $label: $lock differs / main has no $dep → real install."
+  fi
+  if [[ "$label" == composer ]]; then
+    _composer_install_in_container "$WT"          # always the laradock workspace container (PHP 7.4 parity)
+  else
+    info "  $label: running '$installer' in $WT (this can take a while)…"
+    ( cd "$WT" && eval "$installer" ) 1>&2 || die "$label install failed in $WT"   # 1>&2: keep stdout pure for --json
+  fi
+  ok "  $label: installed $dep."
+}
+
+# Copy a gitignored local config file from the main checkout into a worktree (once, if present).
+_copy_main_file() {  # <worktree> <relpath>
+  local wt="$1" rel="$2"
+  if [[ -f "$MAIN/$rel" && ! -f "$wt/$rel" ]]; then
+    cp "$MAIN/$rel" "$wt/$rel"; log "  copied $rel from main."
+  fi
+}
+
+# Go-service bootstrap (e.g. employee-management-service): download modules + vendor on the HOST
+# toolchain. NO composer, NO yarn — even if a yarn.lock exists in the repo. Run unconditionally so a
+# feature branch's vendor/ always matches ITS go.mod (the module cache under GOPATH is shared, so
+# 'go mod download' is cheap on a warm cache).
+_provision_go() {  # <worktree>
+  local wt="$1"
+  command -v go >/dev/null 2>&1 || { warn "  go: 'go' not on PATH — skipped; run 'go mod download && go mod vendor' in $wt."; return 0; }
+  info "  go: go mod download…"
+  ( cd "$wt" && go mod download ) 1>&2 || die "go mod download failed in $wt"
+  info "  go: go mod vendor…"
+  ( cd "$wt" && go mod vendor ) 1>&2   || die "go mod vendor failed in $wt"
+  ok "  go: modules downloaded + vendored."
+}
+
+# Per-stack bootstrap: a worktree starts with no gitignored config and no deps. We copy the local
+# config file(s) from main, then provision dependencies for the repo's stack — selected by which
+# manifest the main checkout has. The Go branch is EXCLUSIVE (skips composer/yarn) by design.
+bootstrap() {
+  WT="${1:?usage: bootstrap <worktree-path>}"
+  [[ -d "$WT" ]] || die "No such worktree: $WT"
+  info "Bootstrapping $WT"
+  _copy_main_file "$WT" "$TCW_ENV_FILE"               # .env — gitignored, every repo
+  if [[ -f "$MAIN/go.mod" ]]; then
+    # Go service: Go modules only. Also carry the gitignored local DB config.
+    _copy_main_file "$WT" "dbconfig.yml"
+    _provision_go "$WT"
+  else
+    # PHP (talenta-core): composer (in the laradock container) + yarn, clone-or-install.
+    [[ -f "$MAIN/composer.lock" ]] && _provision "composer" "composer.lock" "vendor" "composer install"
+    [[ -f "$MAIN/yarn.lock" ]]     && _provision "yarn"     "yarn.lock"     "node_modules" "yarn install --frozen-lockfile"
+  fi
+  ok "Bootstrap complete: $WT"
+}
+
+#------------------------------------------------------------------------------
+# Lane commands
+#------------------------------------------------------------------------------
+cmd_mobile() {
+  local dir; dir="$(wt_dir mobile)"
+  if is_worktree "$dir"; then ok "mobile lane already exists: $dir"; return; fi
+  info "Creating persistent mobile lane → $dir ($TCW_MOBILE_PROD)"
+  if branch_exists "$TCW_MOBILE_PROD"; then
+    git worktree add "$dir" "$TCW_MOBILE_PROD"
+  else
+    git fetch origin "$TCW_MOBILE_PROD"
+    git worktree add -b "$TCW_MOBILE_PROD" "$dir" "origin/$TCW_MOBILE_PROD"
+  fi
+  _relativize_worktrees   # relative .git links → lane works inside Docker (/var/www) too
+  if [[ "${OPT_NOBOOTSTRAP:-}" == 1 ]]; then log "  --no-bootstrap: skipping deps."; else bootstrap "$dir"; fi
+  _register_host "$dir"
+  ok "mobile lane ready. cd $dir"
+}
+
+# Shared engine: lane dir is <repo>-worktrees/<repo>-<sanitized-branch> (ticket-keyed → many run in parallel).
+# Creates <branch> off origin/<base> (or reuses it if it already exists), then bootstraps.
+# Reads caller globals: wtype (label/JSON), OPT_NOBOOTSTRAP, OPT_JSON. mode ∈ {standard,integration}.
+_provision_lane() {
+  local branch="$1" base="$2" mode="${3:-standard}"
+  local suffix dir; suffix="$(_slug "$branch")"; dir="$(wt_dir "$suffix")"
+
+  # Already checked out somewhere? point there (idempotent) instead of git's cryptic refusal.
+  local existing; existing="$(worktree_for_branch "$branch")"
+  if [[ -n "$existing" ]]; then
+    ok "'$branch' is already checked out at: $existing"; _emit "$branch" "$base" "$existing" exists; return
+  fi
+  is_worktree "$dir" && die "lane dir already in use: $dir"
+
+  if branch_exists "$branch"; then
+    info "Reusing existing branch $branch → $dir"
+    git worktree add "$dir" "$branch" 1>&2          # 1>&2: keep stdout pure for --json
+  else
+    local start="$base"
+    if git fetch origin "$base" 2>/dev/null && git show-ref --verify --quiet "refs/remotes/origin/$base"; then
+      start="origin/$base"
+    else
+      warn "no origin/$base — basing on local '$base'."
+    fi
+    info "Creating $branch off $start → $dir"
+    git worktree add -b "$branch" "$dir" "$start" 1>&2   # 1>&2: keep stdout pure for --json
+  fi
+  _relativize_worktrees   # relative .git links → lane works inside Docker (/var/www) too
+
+  if [[ "$mode" == "integration" ]]; then
+    git worktree lock "$dir" --reason "long-lived ${wtype:-integration} lane" 2>/dev/null \
+      && log "  locked (long-lived; unlock before remove)." || true
+  fi
+  if [[ "${OPT_NOBOOTSTRAP:-}" == 1 ]]; then log "  --no-bootstrap: skipping deps."; else bootstrap "$dir"; fi
+  _register_host "$dir"
+  _emit "$branch" "$base" "$dir" created
+  ok "${wtype:-work} lane ready on $branch → $dir"
+}
+
+# Platform (default web, --mobile) selects the base column from the registry; --base overrides.
+cmd_work() {
+  local wtype row
+  if row="$(_type_row "${1:-}" 2>/dev/null)"; then wtype="$1"; shift; else wtype="feature"; row="$(_type_row "feature")"; fi
+  local ticket="${1:?usage: work [--web|--mobile] <type> <TICKET> [desc]   (types: '$(self) types')}" desc="${2:-}"
+  local _ prefix web_base mobile_base mode
+  IFS='|' read -r _ prefix web_base mobile_base mode <<<"$row"
+  [[ "$ticket" =~ ^[A-Za-z]+-[0-9]+$ ]] || warn "ticket '$ticket' doesn't look like a Jira key (e.g. TM-123) — continuing."
+  desc="$(_slug "$desc")"
+  local base; if [[ "${OPT_PLATFORM:-web}" == "mobile" ]]; then base="$mobile_base"; else base="$web_base"; fi
+  base="${OPT_BASE:-$base}"                 # explicit --base always wins
+  local branch="${prefix}/${ticket}"; [[ -n "$desc" ]] && branch="${prefix}/${ticket}-${desc}"
+  _provision_lane "$branch" "$base" "$mode"
+}
+
+cmd_resume() {
+  local branch="${1:?usage: resume <branch> [dir-suffix]   (continue an EXISTING feature branch in its own lane)}"
+  local suffix="${2:-$(_slug "$branch")}"
+  local dir; dir="$(wt_dir "$suffix")"
+
+  # Already checked out somewhere? git would refuse with a cryptic error — point there instead.
+  local existing; existing="$(worktree_for_branch "$branch")"
+  if [[ -n "$existing" ]]; then
+    ok "'$branch' is already checked out at: $existing"; log "cd $existing"; return
+  fi
+  is_worktree "$dir" && die "lane dir already in use: $dir  (pass a different [dir-suffix])."
+
+  if branch_exists "$branch"; then
+    info "Resuming local branch $branch → $dir"
+    git worktree add "$dir" "$branch"
+  else
+    info "No local branch; fetching origin/$branch → $dir"
+    git fetch origin "$branch" 2>/dev/null || die "branch '$branch' not found locally or on origin."
+    git worktree add -b "$branch" "$dir" FETCH_HEAD
+    git -C "$dir" branch --set-upstream-to="origin/$branch" "$branch" 2>/dev/null || true
+  fi
+  if [[ "${OPT_NOBOOTSTRAP:-}" == 1 ]]; then log "  --no-bootstrap: skipping deps."; else bootstrap "$dir"; fi
+  _register_host "$dir"
+  ok "resumed $branch. cd $dir"
+}
+
+cmd_hotfix() {
+  # Platform is OPTIONAL and defaults to web: `hotfix <TICKET>` == `hotfix web <TICKET>`.
+  #   web → $TCW_WEB_PROD (master/main) · mobile → $TCW_MOBILE_PROD
+  local target ticket wtype=hotfix base defaulted=
+  case "${1:-}" in
+    web|mobile) target="$1"; ticket="${2:?usage: hotfix [web|mobile] <TICKET>   (platform defaults to web)}" ;;
+    "")         die "usage: hotfix [web|mobile] <TICKET>   (platform defaults to web)" ;;
+    *)          target=web; ticket="$1"; defaulted=1              # lone arg is the ticket → default platform web
+                [[ -n "${2:-}" ]] && die "unexpected argument '$2' — usage: hotfix [web|mobile] <TICKET>" ;;
+  esac
+  case "$target" in
+    web)    base="$TCW_WEB_PROD" ;;
+    mobile) base="$TCW_MOBILE_PROD" ;;
+  esac
+  base="${OPT_BASE:-$base}"
+  [[ -n "$defaulted" ]] && log "no platform specified → defaulting to web (base: $base)"
+  _provision_lane "hotfix/${ticket}" "$base" standard
+}
+
+cmd_review() {
+  local branch="${1:?usage: review <branch>   (Bitbucket Cloud: the PR source branch name)}"
+  local dir; dir="$(wt_dir review)"
+  is_worktree "$dir" && die "review lane busy: $dir — remove it first (review one branch at a time)."
+  info "Fetching origin/$branch for detached review → $dir"
+  git fetch origin "$branch"
+  git worktree add --detach "$dir" FETCH_HEAD
+  _relativize_worktrees   # relative .git links → lane works inside Docker (/var/www) too
+  if [[ "${OPT_NOBOOTSTRAP:-}" == 1 ]]; then log "  --no-bootstrap: skipping deps."; else bootstrap "$dir"; fi
+  ok "review lane ready (detached at origin/$branch). cd $dir"
+  log  "When done: $(self) cleanup  (or git worktree remove $dir)"
+}
+
+cmd_scratch() {
+  local name="${1:-scratch}" dir; dir="/tmp/tc-${name}"
+  is_worktree "$dir" && die "scratch worktree already exists: $dir"
+  warn "scratch lives in /tmp — macOS may purge it on reboot. Keep nothing important here."
+  git worktree add --detach "$dir" HEAD
+  ok "scratch lane ready (detached). cd $dir   (remove with: git worktree remove --force $dir)"
+}
+
+#------------------------------------------------------------------------------
+# Inspection & maintenance
+#------------------------------------------------------------------------------
+cmd_ls() {
+  info "Worktrees for $REPO  →  ${WT_ROOT/#$HOME/~}"      # the per-repo worktrees container path
+  local cols; cols="$(_cols)"                            # terminal width → table never overflows/wraps
+  # Per-worktree local URL (talenta-core only). Derived via talenta-host (single source of the hostname
+  # rule) and emitted in `git worktree list` order so awk can index it by row number.
+  local urls="" hostable=0 _p _h
+  if _host_enabled; then
+    hostable=1
+    while IFS= read -r _p; do
+      [[ "$_p" == worktree\ * ]] || continue
+      _p="${_p#worktree }"
+      _h="$("$(_host_script)" host "$_p" 2>/dev/null)" || _h=""
+      urls+="${_h:+https://$_h},"          # comma-joined: macOS awk forbids newlines in -v values
+    done < <(git worktree list --porcelain)
+  fi
+  git worktree list --porcelain | awk -v main="$MAIN" -v hdr="$C_BOLD" -v rst="$C_RESET" -v cols="$cols" \
+      -v urls="$urls" -v hostable="$hostable" -v RS='' '
+    function rep(n, s,  r){ r=""; while (n-- > 0) r = r s; return r }       # n copies of s (for box rules)
+    function clip(s, w){ return (length(s) > w) ? substr(s, 1, w-1) "…" : s } # truncate to w display cols
+    BEGIN { split(urls, U, ",") }                        # U[k] aligns with the k-th worktree record
+    {
+      path=sha=ref=""; det=lck=0
+      for (i=1;i<=NF;i++) {
+        if      ($i=="worktree") path=$(i+1)
+        else if ($i=="HEAD")     sha=substr($(i+1),1,11)
+        else if ($i=="branch")   { ref=$(i+1); sub(/^refs\/heads\//,"",ref) }
+        else if ($i=="detached") det=1
+        else if ($i=="locked")   lck=1
+      }
+      if (path=="") next
+      n=split(path,a,"/"); base=a[n]                       # folder name only — no leading path
+      lab=(ref!="" ? ref : (det ? "(detached)" : "?"))
+      if (path==main) lab=lab "  (main)"
+      if (lck)        lab=lab "  [locked]"
+      bases[++c]=base; shas[c]=sha; labs[c]=lab; urlc[c]=U[c]
+      if (length(base)>wD) wD=length(base)                 # natural Directory width
+      if (length(lab) >wB) wB=length(lab)                  # natural Branch width
+      if (length(U[c])>wU) wU=length(U[c])                 # natural URL width
+    }
+    END {
+      if (c==0) { print "  (no worktrees)"; exit }
+      wC=11                                                # Commit = abbreviated SHA
+      if (wD<9) wD=9; if (wB<6) wB=6                        # min = header label widths
+      if (hostable) {
+        if (wU<3) wU=3                                      # min = header "URL"; URLs always shown in full
+        # 4 cols: chrome = 5 borders + 8 cell-padding; Commit(wC)+URL(wU) fixed, rest to Directory+Branch.
+        avail = cols - wC - wU - 13; if (avail < 15) avail = 15
+        if (wD + wB > avail) {
+          sD = int(avail * wD / (wD + wB)); sB = avail - sD
+          if (sD < 9) { sD = 9; sB = avail - 9 }
+          if (sB < 6) { sB = 6; sD = avail - 6 }
+          wD = sD; wB = sB
+        }
+        rD=rep(wD+2,"─"); rC=rep(wC+2,"─"); rB=rep(wB+2,"─"); rU=rep(wU+2,"─")
+        printf "┌%s┬%s┬%s┬%s┐\n", rD, rC, rB, rU
+        printf "%s│ %-*s │ %-*s │ %-*s │ %-*s │%s\n", hdr, wD,"Directory", wC,"Commit", wB,"Branch", wU,"URL", rst
+        printf "├%s┼%s┼%s┼%s┤\n", rD, rC, rB, rU
+        for (j=1;j<=c;j++) printf "│ %-*s │ %-*s │ %-*s │ %-*s │\n", wD,clip(bases[j],wD), wC,shas[j], wB,clip(labs[j],wB), wU,clip(urlc[j],wU)
+        printf "└%s┴%s┴%s┴%s┘\n", rD, rC, rB, rU
+      } else {
+        # 3 cols (repos without per-worktree hostnames): chrome = 4 borders + 6 cell-padding.
+        avail = cols - wC - 10; if (avail < 18) avail = 18
+        if (wD + wB > avail) {
+          sD = int(avail * wD / (wD + wB)); sB = avail - sD
+          if (sD < 9) { sD = 9; sB = avail - 9 }
+          if (sB < 6) { sB = 6; sD = avail - 6 }
+          wD = sD; wB = sB
+        }
+        rD=rep(wD+2,"─"); rC=rep(wC+2,"─"); rB=rep(wB+2,"─")  # +2 for the one-space cell padding
+        printf "┌%s┬%s┬%s┐\n", rD, rC, rB
+        printf "%s│ %-*s │ %-*s │ %-*s │%s\n", hdr, wD,"Directory", wC,"Commit", wB,"Branch", rst
+        printf "├%s┼%s┼%s┤\n", rD, rC, rB
+        for (j=1;j<=c;j++) printf "│ %-*s │ %-*s │ %-*s │\n", wD,clip(bases[j],wD), wC,shas[j], wB,clip(labs[j],wB)
+        printf "└%s┴%s┴%s┘\n", rD, rC, rB
+      }
+    }'
+}
+
+cmd_path() {
+  local lane="${1:?usage: path <suffix>   (main, mobile, review, or a branch e.g. bugfix/TM-1)}"
+  [[ "$lane" == "main" ]] && { printf '%s\n' "$MAIN"; return; }
+  printf '%s\n' "$(wt_dir "$(_slug "$lane")")"   # accepts a branch (bug/TM-1) or a sanitized suffix
+}
+
+# exec hands the TTY to claude and returns control here on exit.
+cmd_claude() {
+  command -v claude >/dev/null 2>&1 || die "the 'claude' CLI isn't on PATH — install Claude Code first."
+  local dir
+  if (($# == 0)) || [[ "$1" == -* ]]; then
+    dir="$(git rev-parse --show-toplevel 2>/dev/null)" \
+      || die "not inside a git worktree — pass a <ticket|branch|suffix> (e.g. '$(self) claude TM-1')."
+  else
+    dir="$(_resolve_lane "$1")" || exit 1   # _resolve_lane prints its own error
+    shift
+  fi
+  [[ -d "$dir" ]] || die "worktree dir does not exist: $dir"
+  is_worktree "$dir" || warn "$dir isn't a registered worktree — launching claude there anyway."
+  info "claude → ${dir/#$HOME/~}"
+  cd "$dir" || die "cannot cd into $dir"
+  exec claude "$@"
+}
+
+cmd_sync_env() {
+  local wt="${1:?usage: sync-env <worktree-path>}"
+  [[ -f "$MAIN/$TCW_ENV_FILE" ]] || die "main has no $TCW_ENV_FILE to sync from."
+  cp "$MAIN/$TCW_ENV_FILE" "$wt/$TCW_ENV_FILE"
+  ok "Re-copied $TCW_ENV_FILE from main into $wt"
+  _register_host "$wt"   # re-apply this lane's APP_URL/HOST_INFO (the copy above reset it to main's)
+}
+
+cmd_cleanup() {
+  info "Cleanup: removing CLEAN worktrees proven merged into origin/$TCW_BASE"
+  git fetch origin "$TCW_BASE" >/dev/null 2>&1 || warn "fetch origin/$TCW_BASE failed — using local ref."
+  local mobile_dir; mobile_dir="$(wt_dir mobile)"
+  local path branch
+  while IFS= read -r path; do
+    [[ "$path" == "$MAIN" || "$path" == "$mobile_dir" ]] && continue   # never touch main or the persistent mobile lane
+    if _is_locked "$path"; then warn "skip (locked, long-lived): $path"; continue; fi
+    branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [[ -z "$branch" ]]; then
+      warn "skip (detached, manual): $path"; continue
+    fi
+    if [[ -n "$(git -C "$path" status --porcelain)" ]]; then
+      warn "skip (dirty): $path [$branch]"; continue
+    fi
+    # merged? ancestry OR content-equivalence (covers squash/rebase merges)
+    if git merge-base --is-ancestor "$branch" "origin/$TCW_BASE" 2>/dev/null \
+       || [[ -z "$(git cherry "origin/$TCW_BASE" "$branch" 2>/dev/null | grep '^+' || true)" ]]; then
+      info "removing merged: $path [$branch]"
+      if git worktree remove --force "$path"; then   # --force also clears gitignored deps (lane is clean & merged)
+        _unregister_host "$path"   # tear down the lane's local hostname (vhost + /etc/hosts)
+        git branch -d "$branch" 2>/dev/null || warn "  worktree removed; kept branch $branch (not fully merged?)."
+      else
+        warn "skip (remove failed — locked/in use?): $path [$branch]"
+      fi
+    else
+      warn "skip (not proven merged): $path [$branch]"
+    fi
+  done < <(git worktree list --porcelain | awk '/^worktree /{print $2}')
+  git worktree prune
+  rmdir "$WT_ROOT" 2>/dev/null && log "removed empty container $WT_ROOT" || true   # tidy when the last lane is gone
+  ok "Cleanup done (prune complete)."
+}
+
+cmd_doctor() {
+  info "Worktree health for $REPO (main: $MAIN)"
+  echo; git worktree list; echo
+  local mobile_dir; mobile_dir="$(wt_dir mobile)"
+  local path issues=0
+  while IFS= read -r path; do
+    local disk; disk="$(du -sh "$path" 2>/dev/null | cut -f1 || echo '?')"
+    printf '  %s%s%s  (%s)\n' "$C_BOLD" "$path" "$C_RESET" "$disk"
+    # symlinked dep dirs must NOT exist under the clone policy
+    for dep in vendor node_modules; do
+      if [[ -L "$path/$dep" ]]; then
+        warn "    $dep is a SYMLINK — unsafe (writes leak to main). Fix: rm '$path/$dep' && bootstrap '$path'"
+        issues=$((issues+1))
+      fi
+    done
+    # .env presence + key drift vs main
+    if [[ -f "$MAIN/$TCW_ENV_FILE" ]]; then
+      if [[ ! -f "$path/$TCW_ENV_FILE" ]]; then
+        [[ "$path" != "$MAIN" ]] && { warn "    missing $TCW_ENV_FILE — run: sync-env '$path'"; issues=$((issues+1)); }
+      elif [[ "$path" != "$MAIN" ]]; then
+        local miss; miss="$(comm -23 \
+          <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$MAIN/$TCW_ENV_FILE" | sort -u) \
+          <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$path/$TCW_ENV_FILE" | sort -u) | tr '\n' ' ')"
+        [[ -n "${miss// /}" ]] && { warn "    $TCW_ENV_FILE missing keys vs main: $miss(run sync-env)"; issues=$((issues+1)); }
+      fi
+    fi
+  done < <(git worktree list --porcelain | awk '/^worktree /{print $2}')
+  echo
+  # prunable / locked
+  git worktree list --porcelain | grep -q '^prunable' && { warn "Prunable entries exist → run: git worktree prune"; issues=$((issues+1)); }
+  git worktree list --porcelain | grep -q '^locked'   && info "Some worktrees are locked (expected for removable media / active agents)."
+  if (( issues == 0 )); then ok "No issues found."; else warn "$issues issue(s) flagged above."; fi
+}
+
+cmd_types() {
+  info "Ticket-type registry (edit TCW_TYPES near the top of this script to add a type):"
+  { printf 'TYPE|PREFIX|WEB-BASE|MOBILE-BASE|MODE\n'; printf '%s\n' "$TCW_TYPES"; } \
+    | awk -F'|' 'NF>=5{printf "  %-11s %-12s %-10s %-18s %s\n",$1,$2,$3,$4,$5}'
+  log "Platform: default Web; pass --mobile to use the Mobile-API base."
+}
+
+# Provision many lanes from a file. Lines: "<type> <TICKET> [desc]" (whitespace-separated; # comments ok).
+cmd_batch() {
+  local file="${1:?usage: batch <file>   (lines: <type> <TICKET> [desc]; blank/# lines ignored)}"
+  [[ -f "$file" ]] || die "no such file: $file"
+  local n=0 fails=0 btype bticket bdesc
+  while read -r btype bticket bdesc || [[ -n "${btype:-}" ]]; do
+    [[ -z "${btype// /}" || "$btype" == \#* ]] && continue
+    info "── batch row: $btype $bticket ${bdesc:-}"
+    if ( cmd_work "$btype" "$bticket" "${bdesc:-}" ); then n=$((n+1)); else warn "row failed: $btype $bticket"; fails=$((fails+1)); fi
+  done < <(tr -d '\r' < "$file")   # tolerate CRLF files
+  ok "batch done: $n created, $fails failed."
+}
+
+#------------------------------------------------------------------------------
+# Remove & init
+#------------------------------------------------------------------------------
+_remove_summary() {  # <ticket> <path> <branch> <status>
+  ok "Worktree removed"; [[ "$4" != "pruned" ]] && ok "Registry updated"
+  _say "Ticket: $1"; _say "Path:   $2"; _say "Branch: $3 (preserved)"
+  _emit "$3" "" "$2" "$4"
+}
+
+# Remove the worktree for a ticket. Keeps the local branch; never touches remotes.
+cmd_remove() {
+  local ticket="${1:?usage: remove <TICKET> [--force]   (removes the lane; keeps the branch)}"
+  [[ "$ticket" =~ ^[A-Za-z]+-[0-9]+$ ]] || warn "ticket '$ticket' doesn't look like a Jira key — matching loosely (tickets are case-sensitive)."
+  local matches; matches="$(_worktrees_for_ticket "$ticket")"
+  [[ -n "$matches" ]] || die "no worktree found for ticket '$ticket' (run '$(self) ls')."
+  if [[ "$(printf '%s\n' "$matches" | grep -c .)" -gt 1 ]]; then
+    warn "multiple worktrees match '$ticket':"; printf '%s\n' "$matches" | sed 's/^/    /' >&2
+    die "refusing to guess — remove the exact one with: git worktree remove <path>"
+  fi
+  local path="$matches"
+  [[ "$path" == "$MAIN" ]] && die "refusing to remove the main checkout."
+  [[ "$path" == "$(wt_dir mobile)" ]] && die "refusing to remove the persistent mobile lane."
+  local branch; branch="$(_branch_of_worktree "$path")"; [[ -n "$branch" ]] || branch="(detached)"
+
+  # Orphaned entry (lane dir was manually rm -rf'd)? just prune the stale metadata and report.
+  if [[ ! -d "$path" ]]; then
+    warn "lane dir already gone: $path — pruning stale metadata only."
+    git worktree prune 1>&2
+    _remove_summary "$ticket" "$path" "$branch" pruned; return
+  fi
+
+  if [[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]]; then
+    if [[ "${OPT_FORCE:-}" != 1 ]]; then
+      warn "uncommitted changes in $path — removal blocked."
+      info "Recover, then retry:"
+      log  "  • commit:  git -C '$path' add -A && git -C '$path' commit -m WIP"
+      log  "  • stash:   git -C '$path' stash"
+      log  "  • inspect: git -C '$path' status"
+      log  "  • discard: $(self) remove $ticket --force   (⚠ uncommitted changes WILL be lost)"
+      die  "blocked (uncommitted changes)."
+    fi
+    warn "--force: discarding uncommitted changes in $path"
+  fi
+
+  # Locked (e.g. epic integration lane): only --force will unlock + remove.
+  if _is_locked "$path"; then
+    [[ "${OPT_FORCE:-}" == 1 ]] || die "lane is locked (epic/long-lived). Re-run with --force to unlock + remove."
+    git worktree unlock "$path" 2>/dev/null || true
+  fi
+
+  _unregister_host "$path"   # drop the lane's local hostname (vhost + /etc/hosts) before the dir goes away
+
+  # The dirty-guard above already blocked real uncommitted/untracked SOURCE changes (or the user
+  # opted in with --force). Whatever's left is gitignored, regenerable deps (vendor/node_modules/.env);
+  # a plain `git worktree remove` leaves those, then fails to rmdir the non-empty dir. So force the
+  # git-level removal — this does NOT bypass our guard (that already ran).
+  if ! git worktree remove --force "$path" 1>&2; then
+    warn "git worktree remove failed — falling back to manual cleanup of the lane dir."
+    rm -rf "$path" 1>&2 || true
+  fi
+  git worktree prune 1>&2     # update git's worktree registry/metadata (1>&2: keep stdout pure for --json)
+  rmdir "$WT_ROOT" 2>/dev/null && log "removed empty container $WT_ROOT" || true   # tidy when the last lane is gone
+
+  _remove_summary "$ticket" "$path" "$branch" removed
+}
+
+# Idempotent setup: validate repo, ensure config/helper/alias/mobile-lane exist.
+# Safe to re-run; honors --no-bootstrap (skips the mobile dep install) and --force (any repo).
+cmd_init() {
+  local changed=0 rc alias_line shell_name selfpath
+  selfpath="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"   # this script's real absolute path
+
+  # 1. validate repo — hard-fail on a non-talenta repo unless overridden.
+  if ! git -C "$MAIN" config --get remote.origin.url 2>/dev/null | grep -q 'talenta-core'; then
+    [[ "${OPT_FORCE:-}" == 1 || "${TCW_ALLOW_ANY_REPO:-}" == 1 ]] \
+      || die "this doesn't look like the talenta-core repo (origin mismatch). Re-run with --force to proceed anyway."
+    warn "origin doesn't look like talenta-core — proceeding (--force)."
+  fi
+  ok "Repository detected: $REPO"
+
+  # 2. git worktree support → the .worktreeinclude config file
+  if [[ -f "$MAIN/$TCW_INCLUDE" ]]; then
+    ok "Git worktree support already configured"
+  else
+    printf '# Files copied into Claude worktrees (gitignored only).\n%s\n' "$TCW_ENV_FILE" > "$MAIN/$TCW_INCLUDE"
+    ok "Git worktree support configured ($TCW_INCLUDE created)"; changed=1
+  fi
+
+  # 3. helper executable
+  [[ -x "$selfpath" ]] || { chmod +x "$selfpath" 2>/dev/null && changed=1 || true; }
+
+  # 4. aliases — mtree (open interactive) + mwt (run a command, in interactive). shell-aware; idempotent.
+  shell_name="$(basename "${SHELL:-zsh}")"
+  case "$shell_name" in
+    bash) rc="$HOME/.bashrc" ;;
+    *)    rc="${ZDOTDIR:-$HOME}/.zshrc" ;;
+  esac
+  if [[ -f "$rc" ]] && grep -Eq '^[[:space:]]*alias mtree=' "$rc"; then
+    ok "Required aliases already installed ($rc)"
+  else
+    printf "\n# mtree (Mekari Git Worktree) helper\nalias mtree='%s'\nalias mwt='%s'\n" "$selfpath" "$selfpath" >> "$rc"
+    ok "Aliases installed (mtree + mwt → helper in $rc — run: source $rc)"; changed=1
+  fi
+
+  # 5. workspace structure
+  [[ -w "$PARENT" ]] && ok "Workspace structure verified" || warn "parent dir $PARENT is not writable."
+
+  # 6. Mobile API worktree (non-fatal; honors --no-bootstrap; subshell isolates a die)
+  if is_worktree "$(wt_dir mobile)"; then
+    ok "Mobile API worktree detected"
+  else
+    info "Initializing Mobile API worktree…"
+    if ( cmd_mobile ); then ok "Mobile API worktree initialized"; changed=1
+    else warn "Mobile API worktree init failed (branch/network?) — run 'mwt mobile' later."; fi
+  fi
+
+  (( changed == 0 )) && ok "No action required." || ok "Setup completed successfully."
+}
+
+#------------------------------------------------------------------------------
+# Welcome banner — Claude-Code-style box (shown when run with no command).
+# Cells are PLAIN text; colour is wrapped AROUND each padded cell so the visible
+# width math (${#text} = display columns under UTF-8) keeps every row TW wide.
+#------------------------------------------------------------------------------
+_padr() { local w="$1" t="$2" n="${#2}"; (( n > w )) && { printf '%s' "${t:0:$w}"; return; }; printf '%s%*s' "$t" "$(( w - n ))" ''; }
+_brow() {  # <left> <right> [lcol] [rcol]   →   │ left  right │
+  local lp rp; lp="$(_padr "$LW" "$1")"; rp="$(_padr "$RW" "$2")"
+  printf '%s\n' "${O}│${R} ${3:-}${lp}${3:+$R}  ${4:-}${rp}${4:+$R} ${O}│${R}"
+}
+_btop() { local n="${#1}" sp; sp="$(printf '%*s' "$(( TW - n - 5 ))" '')"; printf '%s\n' "${O}╭─ ${BO}${1}${R}${O} ${sp// /─}╮${R}"; }
+_bbot() { local sp; sp="$(printf '%*s' "$(( TW - 2 ))" '')"; printf '%s\n' "${O}╰${sp// /─}╯${R}"; }
+_bfull() { local pt; pt="$(_padr "$(( TW - 4 ))" "$1")"; printf '%s\n' "${O}│${R} ${2:-}${pt}${2:+$R} ${O}│${R}"; }   # one full-width row
+
+# Real terminal width — stty reads /dev/tty directly. (tput cols breaks inside $(): its stdout is
+# the capture pipe, not the terminal, so ncurses falls back to terminfo's static default of 80.)
+_cols() {
+  local c
+  c="$(stty size 2>/dev/null </dev/tty | awk '{print $2}')"; [[ "$c" =~ ^[1-9][0-9]*$ ]] && { printf '%s' "$c"; return; }
+  c="$(tput cols 2>/dev/null)"; [[ "$c" =~ ^[1-9][0-9]*$ ]] && { printf '%s' "$c"; return; }
+  printf '%s' "${COLUMNS:-80}"
+}
+# Alternate-screen session (like vim/less/Claude Code): ONE full screen drawn ON TOP of the existing
+# terminal, hiding it, and restored verbatim on exit (?1049 private mode via tput; raw-escape fallback
+# for terminfo without smcup/rmcup). ESC[3J on entry erases scrollback so the previous terminal can't
+# be scrolled back to. Signal traps guarantee we always leave the alt screen (never strand the user).
+#
+# SCROLLING INSIDE this screen: the alternate buffer keeps no scrollback by itself — that is a terminal
+# feature, not something the script can emit. To scroll back through the session, enable your terminal's
+# "save lines to scrollback in alternate screen mode" (iTerm2: Settings → Profiles → Terminal). With it
+# on, the scrollbar/trackpad scrolls THIS session's output (and only it — the prior terminal stays hidden).
+_enter_alt()   { tput smcup 2>/dev/null || printf '\033[?1049h'; tput clear 2>/dev/null || printf '\033[H\033[2J'; printf '\033[3J'; }
+_leave_alt()   { tput rmcup 2>/dev/null || printf '\033[?1049l'; }
+_restore_screen()  { [[ -t 1 ]] && _leave_alt; trap - EXIT INT TERM HUP 2>/dev/null || true; return 0; }
+_on_exit_signal()  { _restore_screen; exit 130; }                  # Ctrl-C / kill: leave alt screen, don't strand the user
+_enter_interactive() {
+  if [[ -t 1 ]]; then _enter_alt; trap _restore_screen EXIT; trap _on_exit_signal INT TERM HUP; fi   # full-screen takeover; always restored
+  cmd_banner
+  cmd_shell "$@"
+  _restore_screen
+}
+
+cmd_banner() {
+  local O="$C_BRAND" B="$C_BOLD" D="$C_DIM" R="$C_RESET" BO="${C_BRAND}${C_BOLD}"
+  local name; name="$(git config user.name 2>/dev/null | awk '{print $1}')"; name="${name:-${USER:-there}}"
+  local cols; cols="$(_cols)"
+  local TW=$cols; (( TW < 60 )) && TW=60          # full terminal width
+  local LW=26 RW; RW=$(( TW - LW - 6 ))
+  local nlanes; nlanes=$(( $(git worktree list 2>/dev/null | wc -l) ))
+  local short="${MAIN/#$HOME/~}" fdiv; fdiv="$(printf '%*s' "$(( TW - 4 ))" '')"; fdiv="${fdiv// /─}"
+
+  # hotfix quick-start entry — the web|mobile platform selector is talenta-core-specific (see Web/Mobile rows below).
+  # Description aligns at col 24 like its neighbours when the label fits; the long talenta label keeps a 2-space gap.
+  local hf_cmd hf_pad hf_row
+  if [[ "$REPO" == "talenta-core" ]]; then hf_cmd="hotfix [web|mobile] <TICKET>"; else hf_cmd="hotfix <TICKET>"; fi
+  hf_pad=$(( 24 - ${#hf_cmd} )); (( hf_pad < 2 )) && hf_pad=2
+  printf -v hf_row '%s%*sprod fix lane' "$hf_cmd" "$hf_pad" ''
+
+  _btop "Mekari Git Worktree  v${TCW_VERSION}"
+  _brow "" ""
+  _brow "Welcome back, ${name}!"          "Quick start"                                  "$B"  "$BO"
+  _brow "  █▄█ ███ ██  ███ ███"           "<type> <TICKET> [desc]  start a lane"            "$O"
+  _brow "  █▀█  █  █ █ █   █  "           "resume <branch>         continue a branch"       "$O"
+  _brow "  █ █  █  ██  ██  ██ "           "remove <TICKET>         drop lane, keep branch"   "$O"
+  _brow "  █ █  █  █ █ █   █  "           "$hf_row"                      "$O"
+  _brow "  █ █  █  █ █ ███ ███"           "claude [TICKET]         open Claude in a lane"   "$O"
+  _bfull "$fdiv" "$D"
+  _bfull "$(printf '%-12s%s' 'Service' "$REPO")"      "$D"
+  _bfull "$(printf '%-12s%s' 'Path'    "$short")"     "$D"
+  _bfull "$(printf '%-12s%s' 'Base'    "$TCW_BASE")"  "$D"
+  if [[ "$REPO" == "talenta-core" ]]; then     # Web / Mobile-API platforms are talenta-core-specific
+    _bfull "$(printf '%-12s%s' 'Web'        "$TCW_WEB_PROD")"    "$D"
+    _bfull "$(printf '%-12s%s' 'Mobile API' "$TCW_MOBILE_PROD")" "$D"
+  fi
+  _bfull "$(printf '%-12s%s active' 'Lanes' "$nlanes")" "$D"
+  _brow "" ""
+  _bbot
+}
+
+#------------------------------------------------------------------------------
+# Interactive shell — bare `mwt` (in a terminal) shows the banner, then this prompt.
+# Type commands WITHOUT the `mwt` prefix; each runs as a fresh subprocess.
+#------------------------------------------------------------------------------
+cmd_shell() {
+  local self="$0" line w sp top p pp title="Mekari Git Worktree" initial="$*"
+  w="$(_cols)"; (( w < 60 )) && w=60   # full terminal width
+  sp="$(printf '%*s' "$(( w - ${#title} - 5 ))" '')"; top="${C_BRAND}╭─ ${C_BOLD}${title}${C_RESET}${C_BRAND} ${sp// /─}╮${C_RESET}"
+  printf -v p  '\001%s\002mwt\001%s\002 \001%s\002❯\001%s\002 ' "$C_DIM" "$C_RESET" "$C_BRAND" "$C_RESET"   # readline prompt (\001/\002 = non-print)
+  printf -v pp '%smwt%s %s❯%s ' "$C_DIM" "$C_RESET" "$C_BRAND" "$C_RESET"                                  # plain copy (for echoing the pre-run command)
+  set -o history 2>/dev/null || true; HISTFILE=''
+  log "Interactive mode — type a command (without the 'mwt' prefix), e.g. 'bugfix TM-1 fix'."
+  while true; do
+    printf '\n%s\n' "$top"
+    if [[ -n "$initial" ]]; then
+      line="$initial"; initial=""; printf '%s%s\n' "$pp" "$line"        # run the command mwt was started with, echoed as if typed
+    else
+      IFS= read -r -e -p "$p" line || { printf '\n'; break; }
+    fi
+    line="${line#"${line%%[![:space:]]*}"}"                              # left-trim
+    [[ "$line" == "mwt "* ]] && { line="${line#mwt }"; line="${line#"${line%%[![:space:]]*}"}"; }
+    case "$line" in
+      ""|mwt)         continue ;;
+      exit|quit|q|x)  break ;;
+      clear|cls)      { tput clear 2>/dev/null || printf '\033[H\033[2J'; } ; printf '\033[3J'; cmd_banner; continue ;;
+      shell|repl)     warn "already in interactive mode."; continue ;;
+    esac
+    history -s -- "$line" 2>/dev/null || true
+    eval "MWT_NESTED=1 $(printf '%q' "$self") $line" || true   # one-shot subprocess (won't re-enter interactive)
+  done
+  log "bye"
+}
+
+#------------------------------------------------------------------------------
+# Help
+#------------------------------------------------------------------------------
+cmd_help() {
+  cat <<EOF
+${C_BOLD}Mekari Git Worktree${C_RESET} — git worktree concurrency helper  ${C_DIM}(project: $REPO)${C_RESET}
+
+${C_BOLD}START / CONTINUE WORK${C_RESET}   (default base is this repo's; --web/--mobile are ${C_DIM}talenta-core only${C_RESET})
+  work <type> <TICKET> [desc]  Create <prefix>/<TICKET>[-desc] off its base → bootstrap.
+                               <type> is any registry type (run '$(self) types'); omit it → 'feature'.
+  <type> <TICKET> [desc]       Every type is also a direct subcommand, e.g. '$(self) bugfix TM-1 npe'.
+  resume <branch> [suffix]     Continue an EXISTING branch (local or origin) in its own lane.
+                               If already checked out, points you there. (aliases: continue, cont)
+  hotfix [web|mobile] <TICKET> hotfix/<TICKET> off ${TCW_WEB_PROD} / ${TCW_MOBILE_PROD}; platform defaults to web.
+  review <branch>              Detached lane at origin/<branch> (Bitbucket: pass the PR SOURCE branch).
+  scratch [name]               Throwaway detached worktree in /tmp.
+  batch <file>                 Provision many: lines '<type> <TICKET> [desc]' (# comments ignored).
+  claude [target] [args…]      Launch Claude Code in a lane (ticket/branch/suffix; omit → current dir). Extra args → claude.
+
+${C_BOLD}SETUP / LIFECYCLE${C_RESET}
+  init                         Idempotent setup: .worktreeinclude, helper, mwt alias, Mobile-API lane.  ${C_DIM}(talenta-core only)${C_RESET}
+  mobile                       Persistent mobile lane (${TCW_MOBILE_PROD}). Idempotent.  ${C_DIM}(talenta-core only)${C_RESET}
+  remove <TICKET> [--force]    Remove a ticket's lane — keeps the local branch; never touches remotes.
+  cleanup                      Remove CLEAN lanes merged into develop (skips locked/dirty); reports rest.
+
+${C_BOLD}FLAGS${C_RESET}
+  --web | --mobile   base platform — ${C_DIM}talenta-core only${C_RESET}  --base <branch>   override the base branch
+  --no-bootstrap     skip dep provisioning              --json            emit a result object on stdout
+  --force            remove: discard uncommitted changes / unlock a locked lane
+
+${C_BOLD}INSPECT${C_RESET}
+  types                        List the ticket-type registry.
+  ls                           List all worktrees.
+  path <suffix>                Print a lane's path (main, mobile, review, or a branch e.g. bugfix/TM-1).
+  bootstrap <path>             (Re)provision .env + vendor (in Docker '$TCW_DOCKER_SERVICE') + node_modules.
+  sync-env <path>              Re-copy .env from main (the initial copy is one-time).
+  doctor                       Health report: disk, symlinked deps, .env drift, prunable/locked.
+  help                         This message.
+
+${C_BOLD}EXAMPLES${C_RESET}
+  $(self) init
+  $(self) bugfix TM-15211 intern-import         # → bugfix/TM-15211-intern-import  off develop
+  $(self) --mobile task TM-15012 sync           # → task/TM-15012-sync             off master-mobile-api
+  $(self) fasttrack TBB-9001 hotpatch           # → fasttrack/TBB-9001-hotpatch    off master
+  $(self) work TM-9000                          # no type → feature/TM-9000        off develop
+  $(self) remove TM-15211                       # remove the lane, keep the branch
+  $(self) claude TM-15211                       # open Claude Code in that ticket's lane
+  $(self) claude TM-15211 -p "run the tests"    # ...forwarding args/flags straight to claude
+EOF
+}
+
+#------------------------------------------------------------------------------
+# Dispatch
+#------------------------------------------------------------------------------
+# Pull global flags out of the args; leave positionals for the command.
+OPT_BASE=""; OPT_PLATFORM=""; OPT_NOBOOTSTRAP=""; OPT_JSON=""; OPT_FORCE=""
+_args=()
+while (($#)); do
+  case "$1" in
+    --base) OPT_BASE="${2:?--base needs a value}"; shift 2 ;;
+    --base=*) OPT_BASE="${1#*=}"; shift ;;
+    --mobile) OPT_PLATFORM=mobile; shift ;;
+    --web) OPT_PLATFORM=web; shift ;;
+    --no-bootstrap) OPT_NOBOOTSTRAP=1; shift ;;
+    --json) OPT_JSON=1; shift ;;
+    --force|-f) OPT_FORCE=1; shift ;;
+    --) shift; while (($#)); do _args+=("$1"); shift; done ;;
+    *) _args+=("$1"); shift ;;
+  esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+# bare `mwt` in a terminal → welcome banner + interactive prompt (Claude-CLI style);
+# `mwt <cmd> …` still runs once and exits, so scripts/aliases are unaffected.
+# In a real terminal (and not a nested one-shot launched from the REPL) ALWAYS run interactively:
+# `mtree` opens the session; `mwt <cmd>` opens it and runs <cmd> as the first command inside it.
+# EXCEPT `claude`: it hands the TTY to a full-screen app, so it must bypass our alt-screen REPL
+# (nesting two alt-screens corrupts the display) — fall straight through to the dispatch below.
+if [[ -z "${MWT_NESTED:-}" && -t 0 && -t 1 && "${1:-}" != "claude" ]]; then
+  _enter_interactive "$@"
+  exit 0
+fi
+# Nested REPL command, a pipe, or a script → run a single command and exit.
+cmd="${1:-banner}"; shift || true
+case "$cmd" in
+  work)          if [[ "${1:-}" == "init" ]]; then cmd_init; else cmd_work "$@"; fi ;;
+  init)          cmd_init ;;
+  remove|rm)     cmd_remove "$@" ;;
+  resume|continue|cont) cmd_resume "$@" ;;
+  hotfix)        cmd_hotfix "$@" ;;
+  review)        cmd_review "$@" ;;
+  scratch)       cmd_scratch "$@" ;;
+  mobile)        cmd_mobile "$@" ;;
+  batch)         cmd_batch "$@" ;;
+  types)         cmd_types ;;
+  ls|list)       cmd_ls "$@" ;;
+  path|go)       cmd_path "$@" ;;
+  claude)        cmd_claude "$@" ;;
+  bootstrap)     bootstrap "$@" ;;
+  sync-env)      cmd_sync_env "$@" ;;
+  cleanup)       cmd_cleanup "$@" ;;
+  doctor)        cmd_doctor "$@" ;;
+  banner)        cmd_banner ;;
+  shell|repl)    _enter_interactive "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) if _type_row "$cmd" >/dev/null 2>&1; then cmd_work "$cmd" "$@";
+     else die "Unknown command/type: $cmd  (run '$(self) help')"; fi ;;
+esac

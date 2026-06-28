@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Claude Code — local, machine-specific settings (a shared .claude/settings.json, if added, stays tracked)
+.claude/settings.local.json
+
+# Local session memory / scratch buffers — personal, not source
+.remember/
+
+# Local env files (mtree copies .env into worktrees; never commit secrets)
+.env

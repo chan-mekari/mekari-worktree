@@ -101,6 +101,25 @@ warn() { printf '%s\n' "${C_YLW}! $*${C_RESET}" >&2; }
 die()  { printf '%s\n' "${C_RED}✗ $*${C_RESET}" >&2; exit 1; }
 
 #------------------------------------------------------------------------------
+# Input validation — treat ticket / branch / config values as UNTRUSTED.
+# Reject anything git could parse as an option (leading '-') or that could escape
+# a path ('..', whitespace, shell metacharacters) before it reaches git/docker/fs.
+#------------------------------------------------------------------------------
+_require_ticket() {  # <ticket> — hard safe-char gate, then soft Jira-format advisory
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid ticket '$1' — letters/digits/._- only, no leading dash."
+  [[ "$1" =~ ^[A-Za-z]+-[0-9]+$ ]] || warn "ticket '$1' doesn't look like a Jira key (e.g. TM-123) — continuing."
+}
+_require_ref() {     # <branch> — valid-ish git ref: starts alnum, no leading '-', no '..'/whitespace
+  case "$1" in -*|*..*|*' '*) die "invalid branch name '$1'." ;; esac
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "invalid branch name '$1' — allowed: letters digits . _ / -"
+}
+_require_safe_cfg() {  # <key> <value> — allow empty; else strict path/name chars, no leading dash
+  [[ -z "$2" ]] && return 0
+  case "$2" in -*) die "unsafe git config wt.$1 value '$2' (leading dash)." ;; esac
+  [[ "$2" =~ ^[A-Za-z0-9._/-]+$ ]] || die "unsafe git config wt.$1 value '$2' — allowed: letters digits . _ / -"
+}
+
+#------------------------------------------------------------------------------
 # Repo discovery — works from ANY worktree
 #------------------------------------------------------------------------------
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository."
@@ -145,6 +164,9 @@ TCW_DOCKER_DIR="$(git -C "$MAIN" config --get wt.dockerDir 2>/dev/null || echo "
 [[ -z "$TCW_DOCKER_DIR" && -f "$PARENT/talenta-docker-dev/docker-compose.yml" ]] && TCW_DOCKER_DIR="$PARENT/talenta-docker-dev"
 TCW_DOCKER_SERVICE="$(git -C "$MAIN" config --get wt.dockerService 2>/dev/null || echo "${TCW_DOCKER_SERVICE:-workspace}")"
 TCW_DOCKER_CODE_ROOT="$(git -C "$MAIN" config --get wt.dockerCodeRoot 2>/dev/null || echo "${TCW_DOCKER_CODE_ROOT:-/var/www}")"
+_require_safe_cfg dockerDir      "$TCW_DOCKER_DIR"        # git config wt.* is repo-controlled → validate
+_require_safe_cfg dockerService  "$TCW_DOCKER_SERVICE"
+_require_safe_cfg dockerCodeRoot "$TCW_DOCKER_CODE_ROOT"
 
 _docker_compose() { docker compose -f "$TCW_DOCKER_DIR/docker-compose.yml" "$@"; }
 _docker_path()    { printf '%s%s' "$TCW_DOCKER_CODE_ROOT" "${1#$PARENT}"; }   # host lane path -> container path
@@ -299,7 +321,7 @@ _provision() {
 _copy_main_file() {  # <worktree> <relpath>
   local wt="$1" rel="$2"
   if [[ -f "$MAIN/$rel" && ! -f "$wt/$rel" ]]; then
-    cp "$MAIN/$rel" "$wt/$rel"; log "  copied $rel from main."
+    cp "$MAIN/$rel" "$wt/$rel"; chmod 600 "$wt/$rel" 2>/dev/null || true; log "  copied $rel from main (perms 600)."
   fi
 }
 
@@ -361,6 +383,7 @@ cmd_mobile() {
 # Reads caller globals: wtype (label/JSON), OPT_NOBOOTSTRAP, OPT_JSON. mode ∈ {standard,integration}.
 _provision_lane() {
   local branch="$1" base="$2" mode="${3:-standard}"
+  _require_ref "$base"                        # base may come from --base or git config wt.* (untrusted)
   local suffix dir; suffix="$(_slug "$branch")"; dir="$(wt_dir "$suffix")"
 
   # Already checked out somewhere? point there (idempotent) instead of git's cryptic refusal.
@@ -402,7 +425,7 @@ cmd_work() {
   local ticket="${1:?usage: work [--web|--mobile] <type> <TICKET> [desc]   (types: '$(self) types')}" desc="${2:-}"
   local _ prefix web_base mobile_base mode
   IFS='|' read -r _ prefix web_base mobile_base mode <<<"$row"
-  [[ "$ticket" =~ ^[A-Za-z]+-[0-9]+$ ]] || warn "ticket '$ticket' doesn't look like a Jira key (e.g. TM-123) — continuing."
+  _require_ticket "$ticket"
   desc="$(_slug "$desc")"
   local base; if [[ "${OPT_PLATFORM:-web}" == "mobile" ]]; then base="$mobile_base"; else base="$web_base"; fi
   base="${OPT_BASE:-$base}"                 # explicit --base always wins
@@ -412,6 +435,7 @@ cmd_work() {
 
 cmd_resume() {
   local branch="${1:?usage: resume <branch> [dir-suffix]   (continue an EXISTING feature branch in its own lane)}"
+  _require_ref "$branch"
   local suffix="${2:-$(_slug "$branch")}"
   local dir; dir="$(wt_dir "$suffix")"
 
@@ -452,11 +476,13 @@ cmd_hotfix() {
   esac
   base="${OPT_BASE:-$base}"
   [[ -n "$defaulted" ]] && log "no platform specified → defaulting to web (base: $base)"
+  _require_ticket "$ticket"
   _provision_lane "hotfix/${ticket}" "$base" standard
 }
 
 cmd_review() {
   local branch="${1:?usage: review <branch>   (Bitbucket Cloud: the PR source branch name)}"
+  _require_ref "$branch"
   local dir; dir="$(wt_dir review)"
   is_worktree "$dir" && die "review lane busy: $dir — remove it first (review one branch at a time)."
   info "Fetching origin/$branch for detached review → $dir"
@@ -469,7 +495,9 @@ cmd_review() {
 }
 
 cmd_scratch() {
-  local name="${1:-scratch}" dir; dir="/tmp/tc-${name}"
+  local name; name="$(_slug "${1:-scratch}")"; [[ -n "$name" ]] || name="scratch"
+  local dir="/tmp/tc-$(id -u)-${name}"     # per-user + slugged: no shared-/tmp collision, no path traversal
+  [[ -L "$dir" ]] && die "refusing scratch: $dir is a symlink."
   is_worktree "$dir" && die "scratch worktree already exists: $dir"
   warn "scratch lives in /tmp — macOS may purge it on reboot. Keep nothing important here."
   git worktree add --detach "$dir" HEAD
@@ -583,8 +611,9 @@ cmd_claude() {
 
 cmd_sync_env() {
   local wt="${1:?usage: sync-env <worktree-path>}"
+  is_worktree "$wt" || die "$wt is not a registered worktree — refusing to copy secrets there."
   [[ -f "$MAIN/$TCW_ENV_FILE" ]] || die "main has no $TCW_ENV_FILE to sync from."
-  cp "$MAIN/$TCW_ENV_FILE" "$wt/$TCW_ENV_FILE"
+  cp "$MAIN/$TCW_ENV_FILE" "$wt/$TCW_ENV_FILE"; chmod 600 "$wt/$TCW_ENV_FILE" 2>/dev/null || true
   ok "Re-copied $TCW_ENV_FILE from main into $wt"
   _register_host "$wt"   # re-apply this lane's APP_URL/HOST_INFO (the copy above reset it to main's)
 }

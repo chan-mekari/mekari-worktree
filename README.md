@@ -23,6 +23,9 @@ security practices, an FAQ, and how to collaborate — is published via GitHub P
 
 The source lives at [`docs/guide.html`](docs/guide.html).
 
+For the product spec — problem, core features, user flows, architecture, tech stack, requirements,
+and the roadmap — see [`docs/PRD.md`](docs/PRD.md).
+
 ## Requirements
 
 - **Bash** and **git** (uses `git worktree`).
@@ -110,6 +113,24 @@ git config wt.base develop          # the base branch new lanes branch from
 git config wt.dockerDir <path>      # laradock directory (talenta-core)
 git config wt.dockerService workspace
 ```
+
+## Upcoming
+
+**AI-assisted lane creation from a Jira URL** *(planned — not in v1.0.6)*. Paste a ticket URL and let
+Claude name the lane for you:
+
+```bash
+mwt feature https://jurnal.atlassian.net/browse/WEB-1234
+# reads the ticket (user story → acceptance criteria → description),
+# suggests a kebab-case description, e.g.  validate-duplicate-tax-number
+# previews [Y]accept / [E]dit / [C]ancel, then creates
+#   feature/WEB-1234-validate-duplicate-tax-number
+```
+
+mtree stays credential-free: it delegates ticket retrieval and description generation to the `claude`
+CLI (Atlassian MCP), then routes the approved name through the normal lane engine. Full spec —
+including the naming rules, error handling, and `--yes` auto-accept for automation — in
+[`docs/PRD.md`](docs/PRD.md).
 
 ## Development
 

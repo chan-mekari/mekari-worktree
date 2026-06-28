@@ -1,0 +1,305 @@
+<title>mtree — Mekari Git Worktree · Pitch</title>
+<style>
+  :root{
+    --ink:#14121c; --ink-2:#1b1827; --ink-3:#221d31;
+    --line:rgba(139,92,246,.18); --line-2:rgba(232,229,241,.08);
+    --text:#e8e5f1; --dim:#9a92b2; --faint:#6c6483;
+    --brand:#8b5cf6; --bright:#a78bfa; --deep:#6d28d9;
+    --good:#34d399; --warn:#fbbf24;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0}
+  .page{
+    background:
+      radial-gradient(120% 60% at 50% -10%, rgba(139,92,246,.16), transparent 60%),
+      var(--ink);
+    color:var(--text); font-family:var(--sans);
+    line-height:1.6; font-size:16px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:940px; margin:0 auto; padding:0 24px}
+  section{padding:56px 0; border-top:1px solid var(--line-2)}
+  section:first-of-type{border-top:0}
+  h2{font-family:var(--mono); font-size:13px; letter-spacing:.22em; text-transform:uppercase;
+     color:var(--bright); font-weight:600; margin:0 0 28px}
+  h3{font-size:22px; line-height:1.3; margin:0 0 10px; text-wrap:balance; letter-spacing:-.01em}
+  p{margin:0 0 14px; color:var(--dim); max-width:64ch}
+  strong{color:var(--text); font-weight:600}
+  .accent{color:var(--bright)}
+  code,.mono{font-family:var(--mono)}
+
+  /* ── Hero: the tool's own terminal banner ───────────────── */
+  .hero{padding:64px 0 52px; border-top:0}
+  .eyebrow{font-family:var(--mono); font-size:12px; letter-spacing:.24em; text-transform:uppercase;
+           color:var(--faint); margin:0 0 22px}
+  .term{
+    border:1px solid var(--line); border-radius:12px; overflow:hidden;
+    background:linear-gradient(180deg,#1d1930,#17131f);
+    box-shadow:0 24px 60px -28px rgba(109,40,217,.55), inset 0 1px 0 rgba(167,139,250,.08);
+  }
+  .term-bar{display:flex; align-items:center; gap:8px; padding:11px 15px;
+            border-bottom:1px solid var(--line-2); background:rgba(139,92,246,.06)}
+  .dot{width:11px; height:11px; border-radius:50%}
+  .dot.a{background:#6d28d9}.dot.b{background:#8b5cf6}.dot.c{background:#a78bfa}
+  .term-title{font-family:var(--mono); font-size:12px; color:var(--dim); margin-left:8px; letter-spacing:.04em}
+  .term-title b{color:var(--bright); font-weight:600}
+  .term-body{padding:30px 30px 34px}
+  .wordmark{font-family:var(--mono); font-weight:700; font-size:clamp(40px,8vw,68px);
+            line-height:1; letter-spacing:-.03em; margin:0 0 6px;
+            background:linear-gradient(180deg,#fff,#a78bfa); -webkit-background-clip:text;
+            background-clip:text; color:transparent}
+  .wordmark .cursor{-webkit-text-fill-color:var(--brand); color:var(--brand); animation:blink 1.1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .tagline{font-size:13px; font-family:var(--mono); color:var(--faint); letter-spacing:.04em; margin:0 0 26px}
+  .thesis{font-family:var(--sans); font-size:clamp(22px,3.2vw,30px); line-height:1.32;
+          color:var(--text); font-weight:500; letter-spacing:-.015em; max-width:24ch; margin:0}
+  .thesis .q{color:var(--faint); font-weight:400; font-size:.78em; display:block; margin-bottom:8px}
+  .thesis em{font-style:normal; color:var(--bright)}
+
+  /* ── Lanes diagram ──────────────────────────────────────── */
+  .lanes{display:flex; flex-direction:column; gap:10px}
+  .lane{display:grid; grid-template-columns:108px 1fr auto; align-items:center; gap:16px;
+        padding:13px 16px; border-radius:10px; background:var(--ink-2);
+        border:1px solid var(--line-2); position:relative; overflow:hidden}
+  .lane::before{content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--lc,var(--brand))}
+  .lane .ln{font-family:var(--mono); font-weight:600; font-size:14px; color:var(--lc,var(--bright))}
+  .lane .lr{color:var(--dim); font-size:14.5px}
+  .lane .lt{font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase;
+            color:var(--faint); border:1px solid var(--line-2); border-radius:999px; padding:3px 9px; white-space:nowrap}
+  .lane.work{background:linear-gradient(90deg,rgba(139,92,246,.10),var(--ink-2) 70%)}
+  .lane.work .track{position:absolute; inset:0; pointer-events:none}
+  .lane.work .track::after{content:""; position:absolute; top:0; bottom:0; width:34%;
+        background:linear-gradient(90deg,transparent,rgba(167,139,250,.14),transparent);
+        animation:slide 3.6s ease-in-out infinite}
+  @keyframes slide{0%{left:-40%}60%,100%{left:120%}}
+
+  /* ── Cost row ───────────────────────────────────────────── */
+  .cost{display:grid; grid-template-columns:repeat(3,1fr); gap:16px}
+  .cost .c{background:var(--ink-2); border:1px solid var(--line-2); border-radius:11px; padding:22px}
+  .cost .big{font-family:var(--mono); font-size:30px; font-weight:700; color:var(--text);
+             letter-spacing:-.02em; font-variant-numeric:tabular-nums; margin-bottom:6px}
+  .cost .lbl{font-size:13.5px; color:var(--dim)}
+
+  /* ── Idea callout ───────────────────────────────────────── */
+  .idea{border:1px solid var(--line); border-radius:14px; padding:30px 30px;
+        background:linear-gradient(180deg,rgba(139,92,246,.08),rgba(139,92,246,.02))}
+  .idea .kicker{font-family:var(--mono); font-size:11.5px; letter-spacing:.18em; text-transform:uppercase;
+                color:var(--bright); margin-bottom:14px}
+  .idea h3{font-size:24px}
+  .vs{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:22px}
+  .vs .opt{border-radius:10px; padding:16px 18px; font-size:14px}
+  .vs .good{background:rgba(52,211,153,.08); border:1px solid rgba(52,211,153,.22)}
+  .vs .bad{background:rgba(120,110,140,.08); border:1px solid var(--line-2)}
+  .vs .tag{font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; display:block; margin-bottom:8px}
+  .vs .good .tag{color:var(--good)} .vs .bad .tag{color:var(--faint)}
+  .vs .opt p{margin:0; color:var(--dim); font-size:13.5px}
+
+  /* ── Phases ─────────────────────────────────────────────── */
+  .phases{display:flex; flex-direction:column; gap:0}
+  .ph{display:grid; grid-template-columns:54px 1fr; gap:20px; padding:20px 0; border-bottom:1px solid var(--line-2); align-items:start}
+  .ph:last-child{border-bottom:0}
+  .ph .num{font-family:var(--mono); font-size:13px; color:var(--brand); font-weight:700;
+           border:1px solid var(--line); border-radius:8px; height:40px; width:40px; display:grid; place-items:center}
+  .ph h4{margin:0 0 4px; font-size:17px}
+  .ph h4 span{color:var(--faint); font-weight:400; font-family:var(--mono); font-size:13px}
+  .ph p{margin:0; font-size:14.5px}
+
+  /* ── Metrics ────────────────────────────────────────────── */
+  .metrics{display:grid; grid-template-columns:repeat(2,1fr); gap:14px}
+  .m{background:var(--ink-2); border:1px solid var(--line-2); border-radius:11px; padding:20px 22px}
+  .m .mv{font-family:var(--mono); font-size:24px; font-weight:700; color:var(--good);
+         letter-spacing:-.01em; margin-bottom:5px; font-variant-numeric:tabular-nums}
+  .m .mk{font-size:13.5px; color:var(--dim)}
+
+  /* ── Ask / why-now two-up ───────────────────────────────── */
+  .two{display:grid; grid-template-columns:1fr 1fr; gap:40px}
+  .two ul{margin:0; padding:0; list-style:none}
+  .two li{position:relative; padding:0 0 12px 22px; color:var(--dim); font-size:14.5px}
+  .two li::before{content:"›"; position:absolute; left:2px; top:-1px; color:var(--brand); font-family:var(--mono)}
+  .two li strong{color:var(--text)}
+
+  footer{padding:34px 0 56px; color:var(--faint); font-family:var(--mono); font-size:12px;
+         letter-spacing:.03em; display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px; border-top:1px solid var(--line-2)}
+
+  @media (max-width:680px){
+    .cost,.vs,.metrics,.two{grid-template-columns:1fr}
+    .lane{grid-template-columns:88px 1fr; }
+    .lane .lt{grid-column:2; justify-self:start}
+    .two{gap:24px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .wordmark .cursor{animation:none}
+    .lane.work .track::after{animation:none; display:none}
+  }
+</style>
+
+<div class="page">
+<div class="wrap">
+
+  <!-- HERO -->
+  <section class="hero">
+    <p class="eyebrow">Developer Experience · Internal Tooling · Pitch</p>
+    <div class="term">
+      <div class="term-bar">
+        <span class="dot a"></span><span class="dot b"></span><span class="dot c"></span>
+        <span class="term-title">Mekari Git Worktree · <b>v1.0.6</b> · one self-contained file</span>
+      </div>
+      <div class="term-body">
+        <div class="wordmark">mtree<span class="cursor">▌</span></div>
+        <p class="tagline">~/www/talenta-core ❯ turning a 3-minute context switch into one command</p>
+        <p class="thesis"><span class="q">A monorepo checkout is a single desk.</span>
+          Give every ticket, review, and AI&nbsp;agent <em>its own clean desk</em> — ready to run, in seconds.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROBLEM / COST -->
+  <section>
+    <h2>The problem we pay for daily</h2>
+    <p>Every PR review, hotfix, or parallel ticket in <code>talenta-core</code> means <code>git stash</code> +
+      <code>checkout</code> + a minutes-long Composer/Yarn rebuild against a different lockfile — then all of it
+      again to switch back. <code>git&nbsp;worktree</code> solves the plumbing, but raw, it's fiddly and easy to
+      leave corrupt.</p>
+    <div class="cost">
+      <div class="c"><div class="big">3–5<span style="font-size:15px;color:var(--faint)"> min</span></div>
+        <div class="lbl">per context switch — several times a day, every engineer.</div></div>
+      <div class="c"><div class="big">~30</div>
+        <div class="lbl">engineers paying that tax — it compounds into hours lost daily.</div></div>
+      <div class="c"><div class="big">×N</div>
+        <div class="lbl">agents that each want an isolated, ready checkout to work in.</div></div>
+    </div>
+  </section>
+
+  <!-- LANE MODEL -->
+  <section>
+    <h2>The solution — a lane for every job</h2>
+    <p>A handful of long-lived working directories, each pinned to a role, all sharing one <code>.git</code>.
+      Borrowed from matklad's concurrency-lane model; made one command, the same way every time.</p>
+    <div class="lanes">
+      <div class="lane" style="--lc:#e8e5f1"><span class="ln">main</span><span class="lr">The clean primary checkout — your source of truth.</span><span class="lt">persistent</span></div>
+      <div class="lane" style="--lc:#a78bfa"><span class="ln">mobile</span><span class="lr">Standing lane off the Mobile-API base, kept ready.</span><span class="lt">persistent</span></div>
+      <div class="lane work" style="--lc:#8b5cf6"><span class="track"></span><span class="ln">work</span><span class="lr">One per ticket — run TM-1 and TM-2 side by side, fully isolated.</span><span class="lt">per ticket</span></div>
+      <div class="lane" style="--lc:#7c6fd6"><span class="ln">hotfix</span><span class="lr">Off the production base for an urgent patch, in-flight work untouched.</span><span class="lt">per ticket</span></div>
+      <div class="lane" style="--lc:#6d28d9"><span class="ln">review</span><span class="lr">Detached lane parked at a PR's source branch. Read it, move on.</span><span class="lt">detached</span></div>
+    </div>
+  </section>
+
+  <!-- COMMANDS -->
+  <section>
+    <h2>What you actually type</h2>
+    <div class="term">
+      <div class="term-bar"><span class="dot a"></span><span class="dot b"></span><span class="dot c"></span>
+        <span class="term-title">zsh — talenta-core</span></div>
+      <div class="term-body" style="padding:24px 30px; font-family:var(--mono); font-size:14.5px; line-height:2.1">
+        <div><span style="color:var(--faint)">mwt ❯</span> <span class="accent">bugfix</span> TM-1 npe<span style="color:var(--faint)">     # isolated branch + deps ready, in seconds</span></div>
+        <div><span style="color:var(--faint)">mwt ❯</span> <span class="accent">review</span> feature/X<span style="color:var(--faint)">   # read a teammate's PR, your work untouched</span></div>
+        <div><span style="color:var(--faint)">mwt ❯</span> <span class="accent">claude</span> TM-1<span style="color:var(--faint)">        # launch an AI agent in its own clean lane</span></div>
+        <div><span style="color:var(--faint)">mwt ❯</span> <span class="accent">cleanup</span><span style="color:var(--faint)">          # merged lanes self-garbage-collect</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- AI ASSIST -->
+  <section>
+    <h2>New — name it from the ticket, not from scratch</h2>
+    <p>Paste a Jira URL and Claude reads the actual ticket — user story, acceptance criteria, description — then
+      proposes a clean, convention-following branch name. <strong>You always approve or edit before anything is
+      created.</strong> No embedded credentials: mtree delegates to the <code>claude</code> CLI you already use.</p>
+    <div class="term">
+      <div class="term-bar"><span class="dot a"></span><span class="dot b"></span><span class="dot c"></span>
+        <span class="term-title">zsh — AI-assisted lane</span></div>
+      <div class="term-body" style="padding:24px 30px; font-family:var(--mono); font-size:14.5px; line-height:1.9">
+        <div><span style="color:var(--faint)">mwt ❯</span> <span class="accent">feature</span> https://jurnal.atlassian.net/browse/<span style="color:var(--bright)">WEB-1234</span></div>
+        <div style="color:var(--faint)">· Claude reads the ticket (user story → acceptance criteria → description)…</div>
+        <div style="margin-top:18px; border:1px solid var(--line); border-radius:9px; padding:16px 18px; background:rgba(139,92,246,.05)">
+          <div style="font-family:var(--mono); font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--bright); margin-bottom:12px">Worktree preview</div>
+          <div style="color:var(--dim); font-size:13.5px">Suggested description</div>
+          <div style="color:var(--good); margin:2px 0 12px">validate-duplicate-tax-number</div>
+          <div style="color:var(--dim); font-size:13.5px">Generated worktree</div>
+          <div style="color:var(--text); margin:2px 0 16px">feature/WEB-1234-validate-duplicate-tax-number</div>
+          <div style="font-size:13px"><span style="color:var(--good)">[Y]</span> accept&nbsp;&nbsp;<span style="color:var(--bright)">[E]</span> edit&nbsp;&nbsp;<span style="color:var(--faint)">[C]</span> cancel</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- THE IDEA -->
+  <section>
+    <div class="idea">
+      <div class="kicker">The one non-obvious idea</div>
+      <h3>Dependencies are cloned, never symlinked.</h3>
+      <p>When a lane's lockfile matches main, <code>vendor/</code> and <code>node_modules/</code> are materialized
+        with an <strong class="accent">APFS copy-on-write reflink</strong> — near-instant, ~0 disk until they
+        diverge, fully isolated.</p>
+      <div class="vs">
+        <div class="opt good"><span class="tag">✓ clone-on-write</span>
+          <p>Each lane gets its own real, isolated deps. Builds, caches, and two agents never touch each other.</p></div>
+        <div class="opt bad"><span class="tag">✗ symlink (rejected)</span>
+          <p>One lane's build cache corrupts the pristine main checkout; two agents race a single directory.</p></div>
+      </div>
+      <p style="margin:22px 0 0; color:var(--text)">This is the difference between <strong>parallel work that's safe</strong>
+        and parallel work that occasionally eats your environment.</p>
+    </div>
+  </section>
+
+  <!-- PHASES -->
+  <section>
+    <h2>What we'd be funding — if rebuilt from scratch</h2>
+    <div class="phases">
+      <div class="ph"><div class="num">1</div><div>
+        <h4>Core <span>· repo-agnostic</span></h4>
+        <p>Lane engine, data-driven ticket types, clone-or-install bootstrap, lifecycle &amp; health. <strong style="color:var(--text)">Works in any repo.</strong></p></div></div>
+      <div class="ph"><div class="num">2</div><div>
+        <h4>talenta-core <span>· tuned</span></h4>
+        <p>Web/Mobile split, Composer-in-laradock for PHP parity, per-lane <code>*.local</code> URLs.</p></div></div>
+      <div class="ph"><div class="num">3</div><div>
+        <h4>Ergonomics <span>· agent-ready</span></h4>
+        <p><code>--json</code> output, the <code>claude</code> launcher, interactive REPL, <code>batch</code> provisioning.</p></div></div>
+      <div class="ph"><div class="num">4</div><div>
+        <h4>Reach <span>· beyond Mac/PHP</span></h4>
+        <p>Linux reflink fallback, more stacks, opt-in telemetry to <em class="accent" style="font-style:normal">prove</em> the wins below.</p></div></div>
+    </div>
+  </section>
+
+  <!-- METRICS -->
+  <section>
+    <h2>How we'll know it worked</h2>
+    <div class="metrics">
+      <div class="m"><div class="mv">min → &lt;30s</div><div class="mk">Context switch, warm — or simply one command.</div></div>
+      <div class="m"><div class="mv">≥ 80%</div><div class="mk">Active talenta-core engineers adopting within 30 days.</div></div>
+      <div class="m"><div class="mv">~0</div><div class="mk">Corrupted-checkout incidents; deps never leak into main.</div></div>
+      <div class="m"><div class="mv">flat</div><div class="mk">Disk footprint despite N lanes — reflinks cost ~0 until divergence.</div></div>
+    </div>
+  </section>
+
+  <!-- ASK + WHY NOW -->
+  <section>
+    <div class="two">
+      <div>
+        <h2>The ask</h2>
+        <ul>
+          <li><strong>A maintainer owner</strong> — treat mtree as funded DX infrastructure, not a side project.</li>
+          <li><strong>A lightweight smoke-test suite</strong> — none today; <code>bash -n</code> is the only gate.</li>
+          <li><strong>Opt-in telemetry</strong> — so we measure the wins instead of asserting them.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>Why now</h2>
+        <ul>
+          <li><strong>Cost is low.</strong> One self-contained Bash file — no build, no deps, no server.</li>
+          <li><strong>Risk is contained.</strong> A thin wrapper over <code>git worktree</code>; never pushes or deletes remotes.</li>
+          <li><strong>AI agents make per-task isolation a throughput multiplier</strong> — and the tool already exists, in daily use.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>mtree · Mekari Git Worktree · v1.0.6</span>
+    <span>matklad concurrency-lane model · macOS / APFS</span>
+  </footer>
+
+</div>
+</div>

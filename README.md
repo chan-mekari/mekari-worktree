@@ -14,6 +14,13 @@ The entire program is a **single self-contained Bash script** (`mtree`). There i
 step, package manager, or dependency manifest. Most commands work in any git repo; a few
 (`init`, `mobile`, and the `--web`/`--mobile` platform split) are `talenta-core`-specific.
 
+## Documentation
+
+A full visual guide — overview, the lane model, setup, daily workflow, the command
+reference, security practices, an FAQ, and how to collaborate — lives in
+**[`docs/guide.html`](docs/guide.html)**. Open it in a browser, or serve `docs/` via
+GitHub Pages, to read it rendered.
+
 ## Requirements
 
 - **Bash** and **git** (uses `git worktree`).

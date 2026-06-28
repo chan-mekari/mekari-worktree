@@ -543,6 +543,11 @@
       vhost plus <code>/etc/hosts</code> and <code>APP_URL</code>). Every worktree is instantly browsable in
       isolation — sign in and pick a company exactly like production, without disturbing any other lane.
     </p>
+    <div class="code">
+      <pre><code><span class="c"># each lane gets its own *.local hostname — https://&lt;ticket&gt;-&lt;repo&gt;.local/</span>
+https://proj-1234-your-repo.local/      <span class="c"># → lane: bugfix/PROJ-1234</span>
+https://proj-1305-your-repo.local/      <span class="c"># → lane: feature/PROJ-1305</span></code></pre>
+    </div>
   </section>
 
   <!-- ─── SETUP ──────────────────────────────── -->

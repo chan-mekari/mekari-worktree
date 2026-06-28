@@ -16,10 +16,12 @@ step, package manager, or dependency manifest. Most commands work in any git rep
 
 ## Documentation
 
-A full visual guide — overview, the lane model, setup, daily workflow, the command
-reference, security practices, an FAQ, and how to collaborate — lives in
-**[`docs/guide.html`](docs/guide.html)**. Open it in a browser, or serve `docs/` via
-GitHub Pages, to read it rendered.
+A full guide — overview, the lane model, setup, daily workflow, the command reference,
+security practices, an FAQ, and how to collaborate — is published via GitHub Pages:
+
+**→ <https://chan-mekari.github.io/mekari-worktree/guide.html>**
+
+The source lives at [`docs/guide.html`](docs/guide.html).
 
 ## Requirements
 

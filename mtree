@@ -586,9 +586,11 @@ cmd_ls() {
 }
 
 cmd_path() {
-  local lane="${1:?usage: path <suffix>   (main, mobile, review, or a branch e.g. bugfix/TM-1)}"
+  local lane="${1:?usage: path <suffix>   (main, mobile, review, or a ticket/branch e.g. bugfix/TM-1)}"
   [[ "$lane" == "main" ]] && { printf '%s\n' "$MAIN"; return; }
-  printf '%s\n' "$(wt_dir "$(_slug "$lane")")"   # accepts a branch (bug/TM-1) or a sanitized suffix
+  _resolve_lane "$lane"   # resolve against REAL worktrees (branch → ticket → conventional dir), like cmd_claude.
+                          # (The old wt_dir(_slug "$lane") built a bogus path for type-prefixed lanes,
+                          #  e.g. `path TM-15437` → <repo>-TM-15437 instead of <repo>-story-TM-15437-<slug>.)
 }
 
 # exec hands the TTY to claude and returns control here on exit.
